@@ -8,32 +8,58 @@
 #include "freertos/queue.h"
 
 #include "esp_err.h"
+#include "esp_timer.h"
+#include "esp_random.h"
+
 #include "esp_twai.h"
 #include "esp_twai_onchip.h"
-#include "esp_timer.h"
+
+#include "psa/crypto.h"
 
 // ─────────────────────────────────────────────
 // CONFIG
 // ─────────────────────────────────────────────
 
-#define CAN_TX_PIN       4
-#define CAN_RX_PIN       5
+#define CAN_TX_PIN        4
+#define CAN_RX_PIN        5
 
-#define CAN_BITRATE      250000
-#define UART_BAUDRATE    115200
+#define CAN_BITRATE       250000
+#define UART_BAUDRATE     921600
 
-#define RX_QUEUE_LEN     200
+#define RX_QUEUE_LEN      512
+
+// AES-GCM
+#define AES_KEY_SIZE      16
+#define AES_NONCE_SIZE    12
+
+// ─────────────────────────────────────────────
+// AES KEY
+// ─────────────────────────────────────────────
+
+static const uint8_t AES_KEY[AES_KEY_SIZE] = {
+
+    0x2B, 0x7E, 0x15, 0x16,
+    0x28, 0xAE, 0xD2, 0xA6,
+    0xAB, 0xF7, 0x15, 0x88,
+    0x09, 0xCF, 0x4F, 0x3C
+};
 
 // ─────────────────────────────────────────────
 // TYPES
 // ─────────────────────────────────────────────
 
 typedef struct {
+
     uint32_t id;
+
     bool extended;
+
     bool rtr;
+
     uint8_t dlc;
+
     uint8_t data[8];
+
 } can_frame_info_t;
 
 // ─────────────────────────────────────────────
@@ -41,61 +67,152 @@ typedef struct {
 // ─────────────────────────────────────────────
 
 static twai_node_handle_t twai_node = NULL;
+
 static QueueHandle_t rx_queue = NULL;
 
+static psa_key_id_t aes_key_id = 0;
+
 static volatile uint32_t frame_count = 0;
+
 static volatile uint32_t dropped_frames = 0;
 
-static uint64_t last_time_us = 0;
+static volatile uint64_t total_can_bits = 0;
+
+static volatile uint64_t total_uart_bytes = 0;
 
 // ─────────────────────────────────────────────
-// CALCULATE CAN FRAME BITS
+// AES-GCM INIT
 // ─────────────────────────────────────────────
 
-static uint32_t calculate_can_bits(bool extended,
-                                   uint8_t dlc)
+static void aes_gcm_init(void)
+{
+    psa_status_t status;
+
+    status = psa_crypto_init();
+
+    if (status != PSA_SUCCESS) {
+
+        printf("PSA crypto init failed\n");
+        return;
+    }
+
+    psa_key_attributes_t attributes =
+        PSA_KEY_ATTRIBUTES_INIT;
+
+    psa_set_key_usage_flags(
+        &attributes,
+        PSA_KEY_USAGE_ENCRYPT);
+
+    psa_set_key_algorithm(
+        &attributes,
+        PSA_ALG_GCM);
+
+    psa_set_key_type(
+        &attributes,
+        PSA_KEY_TYPE_AES);
+
+    psa_set_key_bits(
+        &attributes,
+        128);
+
+    status = psa_import_key(
+
+        &attributes,
+
+        AES_KEY,
+        sizeof(AES_KEY),
+
+        &aes_key_id);
+
+    psa_reset_key_attributes(
+        &attributes);
+
+    if (status != PSA_SUCCESS) {
+
+        printf("AES key import failed\n");
+
+    } else {
+
+        printf("AES-GCM initialized\n");
+    }
+}
+
+// ─────────────────────────────────────────────
+// AES-GCM ENCRYPT
+// ─────────────────────────────────────────────
+
+static bool encrypt_frame_gcm(
+
+    const uint8_t *plain,
+    size_t plain_len,
+
+    uint8_t *cipher,
+    size_t *cipher_len)
+{
+    psa_status_t status;
+
+    uint8_t nonce[AES_NONCE_SIZE];
+
+    esp_fill_random(
+        nonce,
+        sizeof(nonce));
+
+    size_t output_len = 0;
+
+    status = psa_aead_encrypt(
+
+        aes_key_id,
+
+        PSA_ALG_GCM,
+
+        nonce,
+        sizeof(nonce),
+
+        NULL,
+        0,
+
+        plain,
+        plain_len,
+
+        cipher,
+        64,
+        &output_len);
+
+    if (status != PSA_SUCCESS) {
+
+        return false;
+    }
+
+    *cipher_len = output_len;
+
+    return true;
+}
+
+// ─────────────────────────────────────────────
+// CALCULATE CAN BITS
+// ─────────────────────────────────────────────
+
+static uint32_t calculate_can_bits(
+    bool extended,
+    uint8_t dlc)
 {
     uint32_t bits;
 
     if (extended) {
 
-        // Extended CAN frame overhead
         bits = 67;
 
     } else {
 
-        // Standard CAN frame overhead
         bits = 47;
     }
 
-    // Add payload
     bits += dlc * 8;
 
-    // Approximate bit stuffing
+    // bit stuffing approximation
     bits = (bits * 12) / 10;
 
     return bits;
-}
-
-// ─────────────────────────────────────────────
-// EXTRACT PGN
-// ─────────────────────────────────────────────
-
-static uint32_t extract_pgn(uint32_t id)
-{
-    uint8_t pf = (id >> 16) & 0xFF;
-    uint8_t ps = (id >> 8) & 0xFF;
-    uint8_t dp = (id >> 24) & 0x01;
-
-    if (pf < 240) {
-
-        return ((uint32_t)dp << 16) |
-               ((uint32_t)pf << 8);
-    }
-
-    return ((uint32_t)dp << 16) |
-           ((uint32_t)pf << 8) |
-           ps;
 }
 
 // ─────────────────────────────────────────────
@@ -110,30 +227,42 @@ static bool twai_rx_callback(
     uint8_t rx_buffer[8] = {0};
 
     twai_frame_t rx_frame = {
+
         .buffer = rx_buffer,
+
         .buffer_len = sizeof(rx_buffer),
     };
 
-    if (twai_node_receive_from_isr(handle,
-                                   &rx_frame) == ESP_OK) {
+    if (twai_node_receive_from_isr(
+            handle,
+            &rx_frame) == ESP_OK) {
 
         can_frame_info_t frame = {0};
 
-        frame.id       = rx_frame.header.id;
-        frame.extended = rx_frame.header.ide;
-        frame.rtr      = rx_frame.header.rtr;
-        frame.dlc      = rx_frame.buffer_len > 8 ?
-                         8 : rx_frame.buffer_len;
+        frame.id =
+            rx_frame.header.id;
 
-        memcpy(frame.data,
-               rx_buffer,
-               frame.dlc);
+        frame.extended =
+            rx_frame.header.ide;
+
+        frame.rtr =
+            rx_frame.header.rtr;
+
+        frame.dlc =
+            rx_frame.buffer_len > 8 ?
+            8 : rx_frame.buffer_len;
+
+        memcpy(
+            frame.data,
+            rx_buffer,
+            frame.dlc);
 
         BaseType_t woken = pdFALSE;
 
-        if (xQueueSendFromISR(rx_queue,
-                              &frame,
-                              &woken) != pdTRUE) {
+        if (xQueueSendFromISR(
+                rx_queue,
+                &frame,
+                &woken) != pdTRUE) {
 
             dropped_frames++;
         }
@@ -145,165 +274,146 @@ static bool twai_rx_callback(
 }
 
 // ─────────────────────────────────────────────
-// PRINT TASK
+// CAN PRINT TASK
 // ─────────────────────────────────────────────
 
 static void can_print_task(void *arg)
 {
     can_frame_info_t frame;
 
+    uint64_t start_time =
+        esp_timer_get_time();
+
     while (1) {
 
-        if (xQueueReceive(rx_queue,
-                          &frame,
-                          portMAX_DELAY) == pdTRUE) {
+        if (xQueueReceive(
+                rx_queue,
+                &frame,
+                portMAX_DELAY) == pdTRUE) {
 
             frame_count++;
-
-            // ─────────────────────────────
-            // TIME
-            // ─────────────────────────────
-
-            uint64_t now =
-                esp_timer_get_time();
-
-            float fps = 0.0f;
-
-            if (last_time_us != 0) {
-
-                uint64_t diff =
-                    now - last_time_us;
-
-                if (diff > 0) {
-
-                    fps =
-                        1000000.0f /
-                        (float)diff;
-                }
-            }
-
-            last_time_us = now;
-
-            // ─────────────────────────────
-            // CALCULATE FRAME BITS
-            // ─────────────────────────────
 
             uint32_t frame_bits =
                 calculate_can_bits(
                     frame.extended,
                     frame.dlc);
 
-            // ─────────────────────────────
-            // UART COUNTER
-            // ─────────────────────────────
+            total_can_bits += frame_bits;
 
-            uint32_t uart_bytes = 0;
+            uint64_t now =
+                esp_timer_get_time();
 
-            uart_bytes += printf(
-                "\n========== CAN FRAME #%lu ==========\n",
-                (unsigned long)frame_count);
+            uint64_t ms =
+                (now - start_time) / 1000;
 
-            // ─────────────────────────────
-            // FRAME TYPE
-            // ─────────────────────────────
+            // AES-GCM encryption
+            uint8_t encrypted[64];
 
-            if (frame.extended) {
+            size_t encrypted_len = 0;
 
-                uint32_t pgn =
-                    extract_pgn(frame.id);
+            encrypt_frame_gcm(
+                frame.data,
+                frame.dlc,
+                encrypted,
+                &encrypted_len);
 
-                uart_bytes += printf(
-                    "Type : EXTENDED 29-bit\n");
+            // ONE LINE OUTPUT
+            printf(
+                "I (%llu) CAP: ms=%llu,id=0x%08lX,ext=%d,dlc=%u,data=",
 
-                uart_bytes += printf(
-                    "ID   : 0x%08lX\n",
-                    (unsigned long)frame.id);
+                (unsigned long long)ms,
 
-                uart_bytes += printf(
-                    "PGN  : %lu\n",
-                    (unsigned long)pgn);
+                (unsigned long long)ms,
 
-            } else {
+                (unsigned long)frame.id,
 
-                uart_bytes += printf(
-                    "Type : STANDARD 11-bit\n");
+                frame.extended,
 
-                uart_bytes += printf(
-                    "ID   : 0x%03lX\n",
-                    (unsigned long)frame.id);
+                frame.dlc
+            );
+
+            // print encrypted payload
+            for (int i = 0;
+                 i < encrypted_len;
+                 i++) {
+
+                printf("%02X ",
+                       encrypted[i]);
             }
 
-            // ─────────────────────────────
-            // FRAME INFO
-            // ─────────────────────────────
-
-            uart_bytes += printf(
-                "RTR  : %s\n",
-                frame.rtr ? "YES" : "NO");
-
-            uart_bytes += printf(
-                "DLC  : %u\n",
-                frame.dlc);
-
-            uart_bytes += printf(
-                "Data : ");
-
-            for (int i = 0; i < frame.dlc; i++) {
-
-                uart_bytes += printf(
-                    "%02X ",
-                    frame.data[i]);
-            }
-
-            uart_bytes += printf("\n");
-
-            // ─────────────────────────────
-            // LOAD CALCULATIONS
-            // ─────────────────────────────
-
-            float bus_load =
-                ((float)(frame_bits * fps)
-                / (float)CAN_BITRATE)
-                * 100.0f;
-
-            float pc_load =
-                ((float)(uart_bytes * fps * 10)
-                / (float)UART_BAUDRATE)
-                * 100.0f;
-
-            // ─────────────────────────────
-            // PRINT STATS
-            // ─────────────────────────────
-
-            uart_bytes += printf(
-                "Frame bits : %lu bits\n",
-                (unsigned long)frame_bits);
-
-            uart_bytes += printf(
-                "FPS        : %.2f frames/sec\n",
-                fps);
-
-            uart_bytes += printf(
-                "Bus Load   : %.2f %%\n",
-                bus_load);
-
-            uart_bytes += printf(
-                "PC Load    : %.2f %%\n",
-                pc_load);
-
-            uart_bytes += printf(
-                "Dropped    : %lu\n",
-                (unsigned long)dropped_frames);
-
-            uart_bytes += printf(
-                "UART Bytes : %lu\n",
-                (unsigned long)uart_bytes);
-
-            uart_bytes += printf(
-                "====================================\n");
+            printf("\n");
 
             fflush(stdout);
+
+            // UART estimate
+            total_uart_bytes += 100;
         }
+    }
+}
+
+// ─────────────────────────────────────────────
+// STATUS TASK
+// ─────────────────────────────────────────────
+
+static void status_task(void *arg)
+{
+    uint32_t last_frames = 0;
+
+    uint32_t last_drops = 0;
+
+    uint64_t last_can_bits = 0;
+
+    uint64_t last_uart = 0;
+
+    while (1) {
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        uint32_t fps =
+            frame_count - last_frames;
+
+        uint32_t drops =
+            dropped_frames - last_drops;
+
+        uint64_t can_bits_sec =
+            total_can_bits - last_can_bits;
+
+        uint64_t uart_bytes_sec =
+            total_uart_bytes - last_uart;
+
+        float bus_load =
+            ((float)can_bits_sec /
+            (float)CAN_BITRATE)
+            * 100.0f;
+
+        float pc_load =
+            ((float)(uart_bytes_sec * 10) /
+            (float)UART_BAUDRATE)
+            * 100.0f;
+
+        printf(
+            "STATS: fps=%lu,bits=%llu,bus=%.2f%%,pc=%.2f%%,drop=%lu\n",
+
+            (unsigned long)fps,
+
+            (unsigned long long)can_bits_sec,
+
+            bus_load,
+
+            pc_load,
+
+            (unsigned long)drops
+        );
+
+        fflush(stdout);
+
+        last_frames = frame_count;
+
+        last_drops = dropped_frames;
+
+        last_can_bits = total_can_bits;
+
+        last_uart = total_uart_bytes;
     }
 }
 
@@ -313,27 +423,26 @@ static void can_print_task(void *arg)
 
 void app_main(void)
 {
-    // ─────────────────────────────
-    // CREATE QUEUE
-    // ─────────────────────────────
+    // AES init
+    aes_gcm_init();
 
+    // create queue
     rx_queue = xQueueCreate(
         RX_QUEUE_LEN,
         sizeof(can_frame_info_t));
 
     if (rx_queue == NULL) {
 
-        printf("Failed to create queue\n");
+        printf("Queue creation failed\n");
+
         return;
     }
 
-    // ─────────────────────────────
-    // TWAI CONFIG
-    // ─────────────────────────────
-
+    // TWAI config
     twai_onchip_node_config_t node_config = {
 
         .io_cfg.tx = CAN_TX_PIN,
+
         .io_cfg.rx = CAN_RX_PIN,
 
         .bit_timing.bitrate =
@@ -341,7 +450,6 @@ void app_main(void)
 
         .tx_queue_depth = 5,
 
-        // Sniffer mode
         .flags.enable_listen_only = true,
     };
 
@@ -350,12 +458,11 @@ void app_main(void)
             &node_config,
             &twai_node));
 
-    // ─────────────────────────────
-    // REGISTER CALLBACK
-    // ─────────────────────────────
-
+    // callback
     twai_event_callbacks_t callbacks = {
-        .on_rx_done = twai_rx_callback,
+
+        .on_rx_done =
+            twai_rx_callback,
     };
 
     ESP_ERROR_CHECK(
@@ -364,14 +471,13 @@ void app_main(void)
             &callbacks,
             NULL));
 
-    // ─────────────────────────────
-    // ACCEPT ALL FRAMES
-    // ─────────────────────────────
-
+    // accept all frames
     twai_mask_filter_config_t filter_config = {
 
         .id = 0,
+
         .mask = 0,
+
         .is_ext = true,
     };
 
@@ -381,50 +487,28 @@ void app_main(void)
             0,
             &filter_config));
 
-    // ─────────────────────────────
-    // START TWAI
-    // ─────────────────────────────
-
+    // enable TWAI
     ESP_ERROR_CHECK(
-        twai_node_enable(twai_node));
-
-    // ─────────────────────────────
-    // START MESSAGE
-    // ─────────────────────────────
+        twai_node_enable(
+            twai_node));
 
     printf("\n");
-    printf("╔════════════════════════════════════╗\n");
-    printf("║         CAN SNIFFER READY         ║\n");
-    printf("╠════════════════════════════════════╣\n");
+    printf("CAN AES-GCM Sniffer Started\n");
 
-    printf("║ CAN Bitrate : %-8d kbps       ║\n",
-           CAN_BITRATE / 1000);
-
-    printf("║ UART Baud   : %-8d            ║\n",
-           UART_BAUDRATE);
-
-    printf("║ TX GPIO     : %-8d            ║\n",
-           CAN_TX_PIN);
-
-    printf("║ RX GPIO     : %-8d            ║\n",
-           CAN_RX_PIN);
-
-    printf("║ Queue Size  : %-8d            ║\n",
-           RX_QUEUE_LEN);
-
-    printf("╚════════════════════════════════════╝\n");
-
-    fflush(stdout);
-
-    // ─────────────────────────────
-    // CREATE TASK
-    // ─────────────────────────────
-
+    // tasks
     xTaskCreate(
         can_print_task,
         "can_print",
-        4096,
+        6144,
         NULL,
         10,
+        NULL);
+
+    xTaskCreate(
+        status_task,
+        "status",
+        4096,
+        NULL,
+        5,
         NULL);
 }
