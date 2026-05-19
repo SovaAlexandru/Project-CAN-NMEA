@@ -3,7 +3,6 @@ idf_component_register(
     INCLUDE_DIRS "."
     PRIV_REQUIRES 
         driver 
-        esp_driver_twai 
         esp_driver_uart
         esp_driver_gpio
         esp_timer 
