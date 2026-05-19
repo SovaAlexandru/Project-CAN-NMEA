@@ -6,7 +6,7 @@
 #include "freertos/task.h"
 #include "driver/uart.h"
 
-#define BOARD_NAME "ESP1"
+#define BOARD_NAME "ESP2"
 
 #define UART_PORT UART_NUM_1
 #define UART_TX_PIN 22
